@@ -1,0 +1,6 @@
+node_modules/
+.port
+.pid
+.token
+run.log
+*.log
