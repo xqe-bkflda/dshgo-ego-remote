@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ego 远程视图</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3; overflow: hidden;
+    font: 13px/1.45 -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; gap: 6px; align-items: center; padding: 6px 8px;
+    background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; flex: 0 0 auto; }
+  select, input, button { font: inherit; color: #e6edf3; background: #0d1117;
+    border: 1px solid #30363d; border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; white-space: nowrap; }
+  button:active { border-color: #58a6ff; }
+  button.on { background: #1f6feb; border-color: #1f6feb; }
+  #url { flex: 1 1 160px; min-width: 100px; }
+  #stage { position: relative; flex: 1 1 auto; overflow: auto; background: #010409;
+    display: flex; align-items: flex-start; justify-content: center; }
+  #screen { display: block; max-width: 100%; height: auto; background: #000;
+    touch-action: none; user-select: none; -webkit-user-select: none; cursor: crosshair; }
+  #stage.raw { justify-content: flex-start; }
+  #stage.raw #screen { max-width: none; }
+  #overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; color: #8b949e; font-size: 14px; text-align: center; padding: 16px; }
+  #kbd { position: fixed; left: -9999px; top: 0; opacity: 0; }
+  .pill { font-size: 12px; color: #8b949e; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid #30363d; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .pill.live { color: #3fb950; border-color: #238636; }
+  .pill.dead { color: #f85149; border-color: #da3633; }
+  @media (max-width: 620px) {
+    header { gap: 4px; padding: 4px 6px; }
+    #url { flex: 1 1 100%; order: 9; }
+    button, select { padding: 6px 7px; font-size: 12px; }
+    #fps, #zoom { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <select id="pages" title="选择要镜像的页面"><option>加载中…</option></select>
+    <button id="attach" title="连接到选中的页面">连接</button>
+    <button id="back" title="后退">←</button>
+    <button id="fwd" title="前进">→</button>
+    <button id="reload" title="刷新">↻</button>
+    <input id="url" placeholder="输入网址后回车" spellcheck="false" autocapitalize="off">
+    <button id="zoom" title="在「铺满」和「原始像素」之间切换">1:1</button>
+    <button id="keyboard" title="用本机键盘直接输入">键盘</button>
+    <span class="pill dead" id="state">未连接</span>
+    <span class="pill" id="fps">–</span>
+  </header>
+  <div id="stage">
+    <canvas id="screen"></canvas>
+    <div id="overlay">正在等第一帧…</div>
+  </div>
+</div>
+<textarea id="kbd" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+<script>
+const TOKEN = '%TOKEN%';
+const $ = (s) => document.querySelector(s);
+const canvas = $('#screen');
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const overlay = $('#overlay');
+const statePill = $('#state');
+const fpsPill = $('#fps');
+const pagesSel = $('#pages');
+
+let meta = { w: 0, h: 0 };
+let frames = 0, lastFpsT = performance.now();
+let connected = false;
+let lastFrameAt = 0;
+let ws = null;
+let sendId = 0;
+const pendingCmd = new Map();
+
+// ── 连接 ───────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws?t=${TOKEN}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setState(false, '已连接'); loadPages(); };
+  ws.onclose = () => {
+    connected = false; setState(false, '连接中断，重连中…');
+    setTimeout(connect, 1200);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') { onText(JSON.parse(ev.data)); return; }
+    onBinary(new Uint8Array(ev.data));
+  };
+}
+
+function onText(m) {
+  if (m.k === 'hello') {
+    if (m.info?.url) $('#url').value = m.info.url;
+    if (m.targetId) { connected = true; setState(true); }
+    pushSize();
+  } else if (m.k === 'attached') {
+    meta = m.meta || meta;
+    connected = true; setState(true);
+    overlay.style.display = 'none';
+    if (m.info?.url) $('#url').value = m.info.url;
+    pushSize();
+  } else if (m.k === 'nav') {
+    if (m.url && m.url !== 'about:blank') $('#url').value = m.url;
+  } else if (m.k === 'detached') {
+    connected = false; setState(false, '已断开'); overlay.style.display = 'flex';
+    overlay.textContent = '目标页面已关闭，请重新选择';
+  } else if (m.k === 'result') {
+    const p = pendingCmd.get(m.id);
+    if (p) { pendingCmd.delete(m.id); p(m); }
+  }
+}
+
+// 帧包：[0x01][uint32 metaLen][meta JSON][JPEG]；metaLen===0 表示沿用上一帧
+let lastMeta = { w: 0, h: 0 };
+let decoding = false;
+let queued = null;
+
+function onBinary(u8) {
+  if (u8[0] !== 0x01) return;
+  const metaLen = (u8[1] << 24 | u8[2] << 16 | u8[3] << 8 | u8[4]) >>> 0;
+  let off = 5;
+  if (metaLen) {
+    try { lastMeta = JSON.parse(new TextDecoder().decode(u8.subarray(off, off + metaLen))) } catch {}
+    off += metaLen;
+  }
+  const jpeg = u8.subarray(off);
+  meta = lastMeta;
+  // 解码还没跟上就只留最新一帧，绝不排队
+  if (decoding) { queued = jpeg; return; }
+  paint(jpeg);
+}
+
+async function paint(jpeg) {
+  decoding = true;
+  try {
+    const blob = new Blob([jpeg], { type: 'image/jpeg' });
+    if (window.createImageBitmap) {
+      const bmp = await createImageBitmap(blob);
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width; canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close?.();
+    } else {
+      const url = URL.createObjectURL(blob);
+      await new Promise((res) => {
+        const im = new Image();
+        im.onload = () => {
+          if (canvas.width !== im.width || canvas.height !== im.height) {
+            canvas.width = im.width; canvas.height = im.height;
+          }
+          ctx.drawImage(im, 0, 0); URL.revokeObjectURL(url); res();
+        };
+        im.onerror = () => { URL.revokeObjectURL(url); res(); };
+        im.src = url;
+      });
+    }
+    // CSS 尺寸跟缓存像素对齐，避免每帧重排
+    if (!stage.classList.contains('raw')) {
+      canvas.style.width = '100%';
+      canvas.style.height = 'auto';
+    }
+    overlay.style.display = 'none';
+    connected = true; setState(true);
+    frames++;
+    lastFrameAt = performance.now();
+  } catch {
+  } finally {
+    decoding = false;
+    if (queued) { const q = queued; queued = null; paint(q); }
+  }
+}
+
+function setState(ok, text) {
+  statePill.className = 'pill ' + (ok ? 'live' : 'dead');
+  statePill.textContent = text || (ok ? '实时' : '未连接');
+}
+
+setInterval(() => {
+  const now = performance.now();
+  const fps = frames / ((now - lastFpsT) / 1000);
+  if (!connected) fpsPill.textContent = '–';
+  else if (now - lastFrameAt > 3000) fpsPill.textContent = '静默';
+  else if (fps < 1) fpsPill.textContent = '静止';   // 只有兜底补帧在跑，说明画面没在动
+  else fpsPill.textContent = fps.toFixed(fps < 10 ? 1 : 0) + ' fps';
+  frames = 0; lastFpsT = now;
+}, 1000);
+
+// ── 告诉服务端按我这里的显示尺寸编码 ─────────────────────────────
+const stage = $('#stage');
+let sizeTimer = 0;
+function pushSize() {
+  if (!ws || ws.readyState !== 1) return;
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(() => {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const raw = stage.classList.contains('raw');
+    const w = raw ? (meta.w || 1280) : Math.round(stage.clientWidth * dpr);
+    const ratio = (meta.h && meta.w) ? meta.h / meta.w : 1.6;
+    const h = Math.round(w * ratio);
+    if (w > 0) ws.send(JSON.stringify({ t: 'resize', w, h }));
+  }, 120);
+}
+window.addEventListener('resize', pushSize);
+window.addEventListener('orientationchange', () => setTimeout(pushSize, 300));
+
+// ── 发送 ───────────────────────────────────────────────────────
+function sendInput(payload) {
+  if (!ws || ws.readyState !== 1 || !connected) return;
+  ws.send(JSON.stringify({ t: 'input', ...payload }));
+}
+function command(cmd, extra) {
+  if (!ws || ws.readyState !== 1) return Promise.resolve({ ok: false });
+  const id = ++sendId;
+  ws.send(JSON.stringify({ t: 'command', cmd, id, ...(extra || {}) }));
+  return new Promise((res) => {
+    pendingCmd.set(id, res);
+    setTimeout(() => { if (pendingCmd.has(id)) { pendingCmd.delete(id); res({ ok: false, error: 'timeout' }) } }, 8000);
+  });
+}
+
+async function loadPages() {
+  try {
+    const r = await fetch('/api/pages?t=' + TOKEN).then((x) => x.json());
+    const keep = pagesSel.value;
+    pagesSel.innerHTML = '';
+    if (!r.pages?.length) { pagesSel.innerHTML = '<option value="">没有可用页面</option>'; return; }
+    for (const p of r.pages) {
+      const o = document.createElement('option');
+      o.value = p.id;
+      let host = '';
+      try { host = p.url && p.url !== 'about:blank' ? new URL(p.url).host : ''; } catch {}
+      o.textContent = (p.title || p.url || p.id).slice(0, 60) + (host ? ' — ' + host : '');
+      if (r.current === p.id || (!r.current && p.id === keep)) o.selected = true;
+      pagesSel.appendChild(o);
+    }
+    if (r.current && !r.pages.some((p) => p.id === r.current)) { connected = false; setState(false, '目标已关闭'); }
+    // 打开就出画面：还没接管任何页面时自动连第一个
+    if (!r.current && !connected && !autoTried) { autoTried = true; attachSelected(); }
+  } catch { pagesSel.innerHTML = '<option value="">读取失败</option>'; }
+}
+let autoTried = false;
+
+async function attachSelected() {
+  const id = pagesSel.value;
+  if (!id) return;
+  setState(false, '连接中…');
+  overlay.style.display = 'flex'; overlay.textContent = '正在连接…';
+  await fetch('/api/attach?id=' + encodeURIComponent(id) + '&t=' + TOKEN).then((r) => r.json())
+    .then((r) => {
+      if (!r.ok) { overlay.textContent = '连接失败：' + (r.error || ''); setState(false); }
+      else { meta = r.meta || meta; overlay.textContent = '等第一帧…'; pushSize(); }
+    }).catch(() => { overlay.textContent = '连接失败'; setState(false); });
+}
+
+// ── 坐标映射 ───────────────────────────────────────────────────
+function toCss(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const w = meta.w || rect.width;
+  const h = meta.h || rect.height;
+  const x = (ev.clientX - rect.left) / rect.width * w;
+  const y = (ev.clientY - rect.top) / rect.height * h;
+  return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+}
+
+// ── 指针 / 触摸 ─────────────────────────────────────────────────
+let lastMove = 0;
+canvas.addEventListener('pointermove', (ev) => {
+  if (ev.pointerType === 'touch') {
+    const { x, y } = toCss(ev);
+    sendInput({ type: 'touchMove', points: [{ x, y, id: 0 }] });
+    return;
+  }
+  const now = performance.now();
+  if (now - lastMove < 16) return;    // 60Hz 上限，WebSocket 不需要更密的节流
+  lastMove = now;
+  const { x, y } = toCss(ev);
+  sendInput({ type: 'mouseMoved', x, y, buttons: ev.buttons });
+});
+canvas.addEventListener('pointerdown', (ev) => {
+  canvas.setPointerCapture?.(ev.pointerId);
+  const { x, y } = toCss(ev);
+  if (ev.pointerType === 'touch') { sendInput({ type: 'touchStart', points: [{ x, y, id: 0 }] }); return; }
+  const button = ev.button === 2 ? 'right' : ev.button === 1 ? 'middle' : 'left';
+  sendInput({ type: 'mousePressed', x, y, button, buttons: ev.buttons, clickCount: 1 });
+});
+canvas.addEventListener('pointerup', (ev) => {
+  const { x, y } = toCss(ev);
+  if (ev.pointerType === 'touch') { sendInput({ type: 'touchEnd', points: [] }); return; }
+  const button = ev.button === 2 ? 'right' : ev.button === 1 ? 'middle' : 'left';
+  sendInput({ type: 'mouseReleased', x, y, button, buttons: 0, clickCount: 1 });
+});
+canvas.addEventListener('pointercancel', (ev) => {
+  if (ev.pointerType === 'touch') sendInput({ type: 'touchEnd', points: [] });
+});
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  const { x, y } = toCss(ev);
+  sendInput({ type: 'mouseWheel', x, y, deltaX: ev.deltaX, deltaY: ev.deltaY });
+}, { passive: false });
+
+// ── 键盘 ───────────────────────────────────────────────────────
+const SPECIAL = new Set(['Enter','Backspace','Tab','Escape','Delete','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown']);
+const kbd = $('#kbd');
+
+function keyPayload(type, ev) {
+  const mods = (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0);
+  return { type, key: ev.key, code: ev.code, modifiers: mods };
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (ev.target === $('#url') || ev.target === pagesSel) return;
+  if (!connected) return;
+  if (ev.key === 'F5' || (ev.ctrlKey && ev.key.toLowerCase() === 'r')) { ev.preventDefault(); command('reload'); return; }
+  if (SPECIAL.has(ev.key)) {
+    ev.preventDefault();
+    sendInput(keyPayload('keyDown', ev));
+    sendInput(keyPayload('keyUp', ev));
+    return;
+  }
+  if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) {
+    ev.preventDefault();
+    sendInput({ type: 'insertText', text: ev.key });
+  }
+});
+
+$('#keyboard').addEventListener('click', () => { kbd.focus(); $('#keyboard').classList.add('on'); });
+kbd.addEventListener('input', () => {
+  const t = kbd.value;
+  if (t) sendInput({ type: 'insertText', text: t });
+  kbd.value = '';
+});
+kbd.addEventListener('keydown', (ev) => {
+  if (SPECIAL.has(ev.key)) {
+    ev.preventDefault();
+    sendInput(keyPayload('keyDown', ev));
+    sendInput(keyPayload('keyUp', ev));
+  }
+});
+kbd.addEventListener('blur', () => $('#keyboard').classList.remove('on'));
+
+// ── 工具栏 ─────────────────────────────────────────────────────
+$('#zoom').onclick = () => {
+  stage.classList.toggle('raw');
+  const on = stage.classList.contains('raw');
+  $('#zoom').classList.toggle('on', on);
+  $('#zoom').textContent = on ? '铺满' : '1:1';
+  if (on) { canvas.style.width = (meta.w || canvas.width) + 'px'; canvas.style.height = 'auto'; }
+  else { canvas.style.width = '100%'; canvas.style.height = 'auto'; }
+  pushSize();
+};
+$('#attach').onclick = attachSelected;
+$('#reload').onclick = () => command('reload');
+$('#back').onclick = () => command('back');
+$('#fwd').onclick = () => command('forward');
+$('#url').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  command('navigate', { url: $('#url').value.trim() });
+  $('#url').blur();
+});
+
+connect();
+setInterval(() => { if (ws?.readyState === 1) loadPages(); }, 8000);
+</script>
+</body>
+</html>
