@@ -1,0 +1,49 @@
+{
+  "name": "dshgo-ego-remote",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "DSH Go 手机端插件：把手机里正在跑的浏览器页面转成网页，在电脑/平板浏览器里看和点",
+  "keywords": [
+    "dsh-go",
+    "dsh-plugin",
+    "browser",
+    "remote",
+    "cast"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dshGo": {
+    "v": 1,
+    "title": {
+      "zh": "浏览器远程",
+      "en": "Browser remote"
+    },
+    "icon": "browser",
+    "wants": [],
+    "contributes": {
+      "panels": [
+        {
+          "id": "remote",
+          "title": {
+            "zh": "浏览器远程",
+            "en": "Browser remote"
+          },
+          "icon": "browser",
+          "placement": [
+            "session.tab",
+            "features",
+            "chat.panel"
+          ]
+        }
+      ]
+    }
+  }
+}
