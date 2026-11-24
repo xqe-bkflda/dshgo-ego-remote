@@ -1,3 +1,13 @@
+<div align="center">
+  <img src="assets/banner.png" alt="dshgo-ego-remote" width="100%">
+</div>
+
+<p align="center">
+[![Plugin](https://img.shields.io/badge/DSH--Go%20plugin-2A3B52?style=flat-square&logo=github&logoColor=white)](https://github.com/xqe-bkflda/dsh-go-market)
+  [![License](https://img.shields.io/badge/license-MIT-3DDC84?style=flat-square)](LICENSE)
+  [![Stars](https://img.shields.io/github/stars/xqe-bkflda/dshgo-ego-remote?style=flat-square&color=8FA5BA)](https://github.com/xqe-bkflda/dshgo-ego-remote/stargazers)
+</p>
+
 # dshgo-ego-remote · 把手机里的浏览器页面转发成一张可操作的网页
 
 DSH Go 手机端插件。在 App 的「浏览器远程」面板里一键起服务，电脑/平板浏览器打开地址就能**实时看到手机上 ego 浏览器正在跑的页面，并且能点、能打字、能滚**——不用装别的软件，走同一 WiFi 就行。
